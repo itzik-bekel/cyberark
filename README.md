@@ -1,4 +1,4 @@
 # cyberark
-CyberARK
+CyberARK PAS Solution diagram - Azure
 
-![workflow](core-pas-solution.PNG)
+![workflow](diagrams/Azure/core-pas-solution.PNG)
