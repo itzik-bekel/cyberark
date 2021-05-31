@@ -1,0 +1,227 @@
+#!/groovy
+
+def repoUrl = "https://github.com/itzik-bekel/cyberark.git"
+def terraformBin = "/opt/jenkins/terraform/terraform"
+def spn = "azure-cred"
+def userPwd
+def azureClientId
+def azureClientKey
+def azureTenantId
+def rgName
+
+pipeline {
+    agent { node { label 'master01' } }
+    parameters {
+        string(name: 'vmName', description: 'VM Name to create')
+        string(name: 'managedImageId', description: 'Image Id to create the VM from')
+        string(name: 'azureSubscriptionId', description: 'Azure Subscription ID')
+        string(name: 'clientIpAddress', description: 'Enter client IP address (will be allowed to access PSM vm), for example: 192.23.12.1')
+
+    }
+    options {
+        skipDefaultCheckout()
+    }
+    stages {
+        stage('Initialization'){
+            steps{
+                script{
+                    deleteDir()
+                    userPwd =  getSecretFromAzureKeyVault("psm-username")
+                    rgName = vmName + "-rg"
+                    withCredentials([azureServicePrincipal(spn)]) {
+                        azureClientId = env.AZURE_CLIENT_ID
+                        azureClientKey = env.AZURE_CLIENT_SECRET
+                        azureTenantId = env.AZURE_TENANT_ID
+                    }
+                    Info_Msg("VM name is: [ ${vmName} ]");
+                }
+            }
+        }
+
+        stage('Git Clone') {
+            steps{
+                script {
+                    Info_Msg("Cloning Git")
+                    git branch: 'master', changelog: false, poll: false, url: repoUrl
+                }
+            }            
+        }
+
+        stage('Terraform Check Topology') {
+            steps {                     
+                script {
+                    dir("Terraform/PSM") {
+                        try {
+                            sh "${terraformBin} init"
+                            sh "chmod 777 .terraform/plugins/linux_amd64/*"              
+                            sh "${terraformBin} validate -var \"client_id=${azureClientId}\" -var \"client_secret=${azureClientKey}\" -var \"tenant_id=${azureTenantId}\" -var subscription_id=\"${azureSubscriptionId}\"  -var \"vmname=${vmName}\" -var \"vm_password=${userPwd}\" -var \"managed_image_id=${managedImageId}\" \"client_ip_addresses=${clientIpAddress}\""
+                            sh "${terraformBin} plan -var \"client_id=${azureClientId}\" -var \"client_secret=${azureClientKey}\" -var \"tenant_id=${azureTenantId}\" -var subscription_id=\"${azureSubscriptionId}\" -var \"vmname=${vmName}\" -var \"vm_password=${userPwd}\" -var \"managed_image_id=${managedImageId}\" -var \"client_ip_addresses=${clientIpAddress}\""                                    
+                        } catch (Exception x) {
+                            error "Exception while checking Terraform topology: ${x}"
+                        }
+                    }
+                }
+            }
+        } 
+
+        stage('Terraform Create PSM VM') {
+            steps {
+                script {
+                    dir("Terraform/PSM") {
+                        try {
+                            sh "${terraformBin} apply -auto-approve -var \"client_id=${azureClientId}\" -var \"client_secret=${azureClientKey}\" -var \"tenant_id=${azureTenantId}\" -var subscription_id=\"${azureSubscriptionId}\" -var \"vmname=${vmName}\" -var \"vm_password=${userPwd}\" -var \"managed_image_id=${managedImageId}\" -var \"client_ip_addresses=${clientIpAddress}\"" 
+                        } catch (Exception x) {
+                            error "error creating terraform VM: ${x}"
+                        }
+                    }
+                }
+            }
+        }         
+    }
+
+    post {   
+        failure {
+            script {
+                kit.Debug_Msg("FALIURE")
+                //deleting all job resources 
+                deleteAzureRmResourceGroup(rgName, azureSubscriptionId)                  
+            }
+        }
+        aborted {
+            script {
+                kit.Debug_Msg("ABORTED")
+                //deleting all job resources
+                deleteAzureRmResourceGroup(rgName, azureSubscriptionId)                         
+            }
+        }
+        cleanup {
+			cleanWs()
+        }
+    }
+}
+
+/**
+* Get Secret from Azure Key Vault
+* Usage example: def secret = getSecretFromAzureKeyVault("secret name")
+* 
+* @author Itzik Bekel
+*/
+def getSecretFromAzureKeyVault(secretName) {
+    Info_Msg("getSecretFromAzureKeyVault ${secretName}")
+    def azureKeyVault = getAzureKeyVaultUrl()
+    def spn = "azure-cred" // jenkins service principle
+    def secrets = [
+        [ $class: 'AzureKeyVaultSecret', secretType: 'Secret', name: secretName, version: '', envVariable: 'AzureKeyVaultSecret' ]
+    ]
+    wrap([$class: 'AzureKeyVaultBuildWrapper',
+        azureKeyVaultSecrets: secrets,
+        keyVaultURLOverride: azureKeyVault,
+        credentialIDOverride: spn
+    ]) {
+        return AzureKeyVaultSecret
+    }
+}
+
+// Get Azure Key Vault URL 
+def getAzureKeyVaultUrl(){
+    def azureKeyVaultUrl = "key vault URL" //I deleted it after tests..
+    return azureKeyVaultUrl;
+}
+
+/**
+ * Delete Azure Resource Group
+ *
+ * @author Itzik Bekel
+ *
+ * @param vmName rgName , subscriptionId
+ *
+ *********WARNING: ALL RESOURCES INSIDE THIS RESOURCE GROUP WILL BE DELETED *************
+ *
+ * Usage example: deleteAzureRmResourceGroup("rgName", "subscriptionId")
+ */
+
+def deleteAzureRmResourceGroup(rgName, subscriptionId) {       
+    Info_Msg("deleteAzureRmResourceGroup ${rgName} ${subscriptionId}")
+    if (rgName == null || rgName == ""){
+        error "rgName cannot be empty"
+    }
+    if (subscriptionId == null || subscriptionId == ""){
+        error "subscriptionId cannot be empty"
+    }
+    def spn = "azure-cred"
+    def validResponseCode = "202" //accepted
+    def _command_output
+    def azureClientId
+    def azureClientKey
+    withCredentials([azureServicePrincipal(spn)]) {
+        azureClientId = env.AZURE_CLIENT_ID
+        azureClientKey = env.AZURE_CLIENT_SECRET
+    }
+    def access_token = generateAzureArmApiToken(azureClientId, azureClientKey)
+    def url = "https://management.azure.com/subscriptions/${subscriptionId}/resourceGroups/${rgName}/?api-version=2019-10-01"
+    def command = """ curl -i -d -k -X DELETE -H "Authorization: Bearer ${access_token}" -H "Content-Type: application/json" ${url} | grep 'HTTP/1.1\\|HTTP/2' | awk '{print \$2}' """
+    try {
+        _command_output = Command_Execution_Sh(command)
+        Info_Msg("Response code: ${_command_output}")
+        if (_command_output != validResponseCode) {
+            error "error, cannot delete rg: ${rgName} , response code: ${_command_output} "
+        }
+    } catch (Exception x) {
+        error "error, cannot delete rg ${x}"
+    }
+}
+
+// Info message
+def Info_Msg(message="no message"){
+    _mode="INFO"
+    _date=Get_Current_Date();
+    echo "[${_date}] [${_mode}] ${message}"
+}
+
+/**
+ * Get Azure ARM API Token
+ *
+ * @author Itzik Bekel
+ *
+ * @param tenant Id, clientId and clientSecret 
+ *
+ * Usage example: generateAzureArmApiToken("tenantId","clientId","clientSecret")
+ */
+
+def generateAzureArmApiToken(tenantId, clientId, clientSecret) {       
+    Info_Msg("generateAzureArmApiToken")
+    if (clientId == null || clientId == ""){
+        error "clientId cannot be empty"
+    }
+    if (clientSecret == null || clientSecret == ""){
+        error "clientSecret cannot be empty"
+    }
+    if (tenantId == null || tenantId == ""){
+        error "tenantId cannot be empty"
+    }
+    def _command_output
+    def url = "https://login.microsoftonline.com/${tenantId}/oauth2/token"
+    def body = "grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}&resource=https%3A%2F%2Fmanagement.azure.com%2F"
+    try {
+          _command_output = Command_Execution_Sh(""" curl -X POST -d "${body}" ${url} | jq -r .access_token """)
+          if (_command_output == null || _command_output == "") {
+            error "error getting azure arm api token, token is null"
+          } else {
+            return _command_output
+          }
+    } catch (Exception x) {
+        error "error getting azure arm api token: ${x}"
+    }
+}
+
+//Linux command execution
+def Command_Execution_Sh(_command, debug=false){
+    if (debug){
+       Info_Msg("Going to run [ ${_command} ]")
+    }
+    def _command_output = sh (
+        script: "${_command}",
+        returnStdout: true
+    ).trim().replace('"', "");
+    return _command_output
+}
